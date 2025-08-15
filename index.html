@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Titled Code Demo</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #111827;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --accent: #22d3ee;
+      --border: #1f2937;
+      --btn: #0ea5e9;
+      --btn-2: #14b8a6;
+      --btn-3: #a78bfa;
+      --radius: 12px;
+    }
+
+    html, body {
+      height: 100%;
+      background: radial-gradient(1200px 600px at 20% -10%, #1e293b 0%, #0b1020 40%, var(--bg) 100%);
+      color: var(--text);
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+    }
+
+    .wrap {
+      max-width: 1100px;
+      margin: 40px auto 80px;
+      padding: 0 16px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      letter-spacing: 0.2px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-weight: 600;
+      cursor: pointer;
+      color: white;
+      background: var(--btn);
+      transition: transform .05s ease, filter .15s ease;
+    }
+    button:hover { filter: brightness(1.08); }
+    button:active { transform: translateY(1px); }
+    .btn-green { background: var(--btn-2); }
+    .btn-purple { background: var(--btn-3); }
+
+    /* 1 block per row */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 24px;
+    }
+
+    .block {
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.02));
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: 0 10px 24px rgba(0,0,0,.25);
+      display: flex;
+      flex-direction: column;
+      min-height: 400px; /* bigger block height */
+    }
+
+    .block-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px;
+      background: rgba(255,255,255,0.03);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      outline: none;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      padding: 6px 8px;
+      border-radius: 8px;
+    }
+
+    .code-wrap {
+      position: relative;
+      padding: 12px;
+      flex: 1;
+    }
+
+    pre {
+      margin: 0;
+      overflow: auto;
+      height: 100%;
+      min-height: 350px; /* larger editable area */
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: radial-gradient(1200px 400px at 80% -80%, rgba(80,200,255,0.15), transparent 60%),
+                  linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+      padding: 14px;
+      font-size: 14px;
+      line-height: 1.5;
+      color: #e6edf3;
+    }
+
+    code[contenteditable="true"] {
+      display: block;
+      white-space: pre;
+      caret-color: #fff;
+      outline: none;
+    }
+
+    footer {
+      text-align: center;
+      margin-top: 26px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>🎯 TPM TSS Demo</h1>
+      <div class="toolbar">
+        <button class="btn-green">Add New Block</button>
+        <button class="btn-purple">Download All</button>
+      </div>
+    </header>
+
+    <section class="grid">
+      <article class="block">
+        <div class="block-header">
+          <div class="title" contenteditable="true">C++ Snippet</div>
+          <div>
+            <button>Copy</button>
+            <button class="btn-green">Download</button>
+          </div>
+        </div>
+        <div class="code-wrap">
+          <pre><code contenteditable="true">
+<!-- Your HTML goes here -->
+// nv_store.cpp
+#include <tss2/tss2_esys.h>
+#include <tss2/tss2_tcti_ldr.h>
+#include <cstring>
+#include <vector>
+#include <iostream>
+#include <stdexcept>
+
+#define CHECK_RC(rc, msg) do { if ((rc) != TSS2_RC_SUCCESS) { \
+    std::cerr << msg << " rc=0x" << std::hex << rc << std::dec << "\n"; \
+    throw std::runtime_error(msg); } } while(0)
+
+static ESYS_CONTEXT* init_esys() {
+    TSS2_TCTI_CONTEXT* tcti = nullptr;
+    // Uses TCTI from $TCTI (or default) e.g., "device:/dev/tpmrm0", "mssim:host=...,port=..."
+    TSS2_RC rc = Tss2_TctiLdr_Initialize(nullptr, &tcti);
+    CHECK_RC(rc, "TctiLdr_Initialize failed");
+
+    ESYS_CONTEXT* esys = nullptr;
+    rc = Esys_Initialize(&esys, tcti, nullptr);
+    if (rc != TSS2_RC_SUCCESS) {
+        Tss2_TctiLdr_Finalize(&tcti);
+        CHECK_RC(rc, "Esys_Initialize failed");
+    }
+    return esys;
+}
+
+// Helper: release ESYS and the underlying TCTI
+static void finalize_esys(ESYS_CONTEXT* esys) {
+    if (!esys) return;
+    TSS2_TCTI_CONTEXT* tcti = Esys_GetTcti(esys);
+    Esys_Finalize(&esys);
+    if (tcti) Tss2_TctiLdr_Finalize(&tcti);
+}
+
+static void define_nv_index(ESYS_CONTEXT* esys, TPMI_RH_NV_INDEX index,
+                            const std::vector<uint8_t>& auth, uint16_t dataSize) {
+    // Owner hierarchy authorizes creating the NV index
+    // If your Owner auth is not the empty buffer, set it here:
+    TPM2B_AUTH ownerAuth = { .size = 0 };
+    Esys_TR_SetAuth(esys, ESYS_TR_RH_OWNER, &ownerAuth);
+
+    TPM2B_AUTH nvAuth{};
+    nvAuth.size = (uint16_t)std::min<size_t>(auth.size(), sizeof(nvAuth.buffer));
+    std::memcpy(nvAuth.buffer, auth.data(), nvAuth.size);
+
+    TPM2B_NV_PUBLIC pub{};
+    pub.size = 0; // per ESAPI, size field is ignored on input
+    pub.nvPublic.nvIndex = index;
+    pub.nvPublic.nameAlg = TPM2_ALG_SHA256;
+    pub.nvPublic.attributes =
+        TPMA_NV_AUTHREAD | TPMA_NV_AUTHWRITE | TPMA_NV_NO_DA;
+    pub.nvPublic.authPolicy.size = 0; // no policy (password-based)
+    pub.nvPublic.dataSize = dataSize;
+
+    ESYS_TR nvHandle = ESYS_TR_NONE;
+    TSS2_RC rc = Esys_NV_DefineSpace(
+        esys,
+        ESYS_TR_RH_OWNER,
+        ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+        &nvAuth, &pub, &nvHandle
+    );
+
+    if (rc == TPM2_RC_NV_DEFINED) {
+        // Already exists — that’s fine; just return.
+        return;
+    }
+    CHECK_RC(rc, "NV_DefineSpace failed");
+
+    // Free local handle (index persists in TPM; this just frees ESYS ref)
+    Esys_TR_Close(esys, &nvHandle);
+}
+
+static ESYS_TR nv_handle_from_public(ESYS_CONTEXT* esys, TPMI_RH_NV_INDEX index) {
+    ESYS_TR handle = ESYS_TR_NONE;
+    TSS2_RC rc = Esys_TR_FromTPMPublic(esys, index,
+                                       ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                       &handle);
+    CHECK_RC(rc, "TR_FromTPMPublic failed");
+    return handle;
+}
+
+static uint16_t query_nv_buffer_max(ESYS_CONTEXT* esys) {
+    // Many TPMs allow up to 1024 bytes per NV Read/Write, but ask politely:
+    TPMI_YES_NO more;
+    TPMS_CAPABILITY_DATA* cap = nullptr;
+    TSS2_RC rc = Esys_GetCapability(
+        esys, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+        TPM2_CAP_TPM_PROPERTIES, TPM2_PT_NV_BUFFER_MAX, 1, &more, &cap);
+    CHECK_RC(rc, "GetCapability NV_BUFFER_MAX failed");
+    uint16_t max = 1024;
+    if (cap && cap->capability == TPM2_CAP_TPM_PROPERTIES &&
+        cap->data.tpmProperties.count >= 1 &&
+        cap->data.tpmProperties.tpmProperty[0].property == TPM2_PT_NV_BUFFER_MAX) {
+        max = (uint16_t)cap->data.tpmProperties.tpmProperty[0].value;
+    }
+    Esys_Free(cap);
+    return max ? max : 1024;
+}
+
+static void nv_write_all(ESYS_CONTEXT* esys, TPMI_RH_NV_INDEX index,
+                         const std::vector<uint8_t>& auth,
+                         const std::vector<uint8_t>& data) {
+    ESYS_TR nv = nv_handle_from_public(esys, index);
+
+    TPM2B_AUTH nvAuth{};
+    nvAuth.size = (uint16_t)std::min<size_t>(auth.size(), sizeof(nvAuth.buffer));
+    std::memcpy(nvAuth.buffer, auth.data(), nvAuth.size);
+    Esys_TR_SetAuth(esys, nv, &nvAuth);
+
+    uint16_t chunk = query_nv_buffer_max(esys);
+
+    uint16_t offset = 0;
+    while (offset < data.size()) {
+        uint16_t n = (uint16_t)std::min<size_t>(chunk, data.size() - offset);
+        TPM2B_MAX_NV_BUFFER buf{};
+        buf.size = n;
+        std::memcpy(buf.buffer, data.data() + offset, n);
+
+        TSS2_RC rc = Esys_NV_Write(
+            esys,
+            /*authHandle=*/nv, /*nvIndex=*/nv,
+            ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+            &buf, /*offset=*/offset);
+        CHECK_RC(rc, "NV_Write failed");
+
+        offset += n;
+    }
+
+    Esys_TR_Close(esys, &nv);
+}
+
+static std::vector<uint8_t> nv_read_all(ESYS_CONTEXT* esys, TPMI_RH_NV_INDEX index,
+                                        const std::vector<uint8_t>& auth, uint16_t totalSize) {
+    ESYS_TR nv = nv_handle_from_public(esys, index);
+
+    TPM2B_AUTH nvAuth{};
+    nvAuth.size = (uint16_t)std::min<size_t>(auth.size(), sizeof(nvAuth.buffer));
+    std::memcpy(nvAuth.buffer, auth.data(), nvAuth.size);
+    Esys_TR_SetAuth(esys, nv, &nvAuth);
+
+    uint16_t chunk = query_nv_buffer_max(esys);
+    std::vector<uint8_t> out;
+    out.reserve(totalSize);
+
+    uint16_t offset = 0;
+    while (offset < totalSize) {
+        uint16_t n = std::min<uint16_t>(chunk, totalSize - offset);
+        TPM2B_MAX_NV_BUFFER* buf = nullptr;
+        TSS2_RC rc = Esys_NV_Read(
+            esys,
+            /*authHandle=*/nv, /*nvIndex=*/nv,
+            ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+            /*size=*/n, /*offset=*/offset, &buf);
+        CHECK_RC(rc, "NV_Read failed");
+
+        out.insert(out.end(), buf->buffer, buf->buffer + buf->size);
+        Esys_Free(buf);
+        offset += n;
+    }
+
+    Esys_TR_Close(esys, &nv);
+    return out;
+}
+
+static void undefine_nv(ESYS_CONTEXT* esys, TPMI_RH_NV_INDEX index) {
+    // Owner auth (empty here; set yours if not empty)
+    TPM2B_AUTH ownerAuth{ .size = 0 };
+    Esys_TR_SetAuth(esys, ESYS_TR_RH_OWNER, &ownerAuth);
+
+    ESYS_TR nv = nv_handle_from_public(esys, index);
+    TSS2_RC rc = Esys_NV_UndefineSpace(
+        esys,
+        ESYS_TR_RH_OWNER, nv,
+        ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE);
+    CHECK_RC(rc, "NV_UndefineSpace failed");
+    Esys_TR_Close(esys, &nv);
+}
+
+int main() {
+    const TPMI_RH_NV_INDEX NV_INDEX = 0x01500010;   // choose your own in owner range
+    const std::vector<uint8_t> nvAuth = {'s','u','p','e','r','s','e','c','r','e','t'}; // demo only
+    const std::vector<uint8_t> secret = { 0xde,0xad,0xbe,0xef,0x00,0x11,0x22,0x33,0x44,0x55,
+                                          0x66,0x77,0x88,0x99,0xaa,0xbb,0xcc,0xdd,0xee,0xff };
+
+    ESYS_CONTEXT* esys = init_esys();
+    try {
+        // 1) Define (idempotent if already exists)
+        define_nv_index(esys, NV_INDEX, nvAuth, (uint16_t)secret.size());
+
+        // 2) Write
+        nv_write_all(esys, NV_INDEX, nvAuth, secret);
+        std::cout << "Wrote " << secret.size() << " bytes to NV index 0x"
+                  << std::hex << NV_INDEX << std::dec << "\n";
+
+        // 3) Read back
+        auto readback = nv_read_all(esys, NV_INDEX, nvAuth, (uint16_t)secret.size());
+        std::cout << "Read " << readback.size() << " bytes. Match: "
+                  << (readback == secret ? "yes" : "NO") << "\n";
+
+        // 4) (Optional) delete it
+        // undefine_nv(esys, NV_INDEX);
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
+    }
+    finalize_esys(esys);
+    return 0;
+}
+
+          </code></pre>
+        </div>
+      </article>
+
+      <article class="block">
+        <div class="block-header">
+          <div class="title" contenteditable="true">NULL</div>
+          <div>
+            <button>Copy</button>
+            <button class="btn-green">Download</button>
+          </div>
+        </div>
+        <div class="code-wrap">
+          <pre><code contenteditable="true">
+.temp {
+  No Code Yet
+}
+          </code></pre>
+        </div>
+      </article>
+    </section>
+
+    <footer>Built for quick sharing and personal snippets.</footer>
+  </div>
+</body>
+</html>
