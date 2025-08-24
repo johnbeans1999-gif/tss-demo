@@ -165,40 +165,39 @@
         <div class="code-wrap">
           <pre><code contenteditable="true">
 <!-- Your CODE goes here -->
+static void set_pcr_selection(TPMS_PCR_SELECTION& sel,
+                              TPMI_ALG_HASH bank,
+                              const std::vector<uint8_t>& pcrs) {
+    sel.hash = bank;
+    sel.sizeofSelect = 3; // PCR 0..23
+    sel.pcrSelect[0] = sel.pcrSelect[1] = sel.pcrSelect[2] = 0;
+    for (uint8_t p : pcrs) {
+        if (p < 24) sel.pcrSelect[p / 8] |= (1u << (p % 8));
+    }
+}
+
 static bool build_pcr_policy_digest(ESYS_CONTEXT* esys,
-                                    TPMI_ALG_HASH name_alg,            // session hash == nv nameAlg
-                                    TPMI_ALG_HASH pcr_hash_bank,       // PCR bank for selection
+                                    TPMI_ALG_HASH name_alg,            // hash alg for the policy session (== NV nameAlg)
+                                    TPMI_ALG_HASH pcr_hash_bank,       // PCR bank used in selection
                                     const std::vector<uint8_t>& pcrs,  // PCR indices
-                                    TPM2B_DIGEST& out_policy)          // filled on success
-{
+                                    TPM2B_DIGEST& out_policy) {
     out_policy.size = 0;
 
-    // Start TRIAL policy session
     ESYS_TR trial = ESYS_TR_NONE;
     TPMT_SYM_DEF symmetric; symmetric.algorithm = TPM2_ALG_NULL;
     TPM2B_NONCE nonce{}; nonce.size = 0;
 
     TSS2_RC rc = Esys_StartAuthSession(
-        esys,
-        ESYS_TR_NONE, ESYS_TR_NONE,
+        esys, ESYS_TR_NONE, ESYS_TR_NONE,
         ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-        &nonce,
-        TPM2_SE_TRIAL, &symmetric, name_alg,
-        &trial);
+        &nonce, TPM2_SE_TRIAL, &symmetric, name_alg, &trial);
     if (rc != TSS2_RC_SUCCESS) return false;
 
-    // Build selection (you already have a helper; reuse it)
     TPMS_PCR_SELECTION one{};
-    // uses your helper: set_pcr_selection(TPMS_PCR_SELECTION&, TPMI_ALG_HASH, std::vector<uint8_t>)
     set_pcr_selection(one, pcr_hash_bank, pcrs);
+    TPML_PCR_SELECTION sels{}; sels.count = 1; sels.pcrSelections[0] = one;
 
-    TPML_PCR_SELECTION sels{};
-    sels.count = 1;
-    sels.pcrSelections[0] = one;
-
-    // PolicyPCR with current PCR values (binds policy to current state)
-    rc = Esys_PolicyPCR(esys, trial,
-                        ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+    rc = Esys_PolicyPCR(esys, trial, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
                         /*pcrDigest*/nullptr, &sels);
     if (rc != TSS2_RC_SUCCESS) {
         Esys_FlushContext(esys, trial);
@@ -206,22 +205,17 @@ static bool build_pcr_policy_digest(ESYS_CONTEXT* esys,
     }
 
     TPM2B_DIGEST* pd = nullptr;
-    rc = Esys_PolicyGetDigest(esys, trial,
-                              ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                              &pd);
-    if (rc == TSS2_RC_SUCCESS && pd && pd->size > 0) {
-        out_policy = *pd; // copy
+    rc = Esys_PolicyGetDigest(esys, trial, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &pd);
+    if (rc == TSS2_RC_SUCCESS && pd && pd->size) {
+        out_policy = *pd;        // copy
         Esys_Free(pd);
         Esys_FlushContext(esys, trial);
         return true;
     }
-
     if (pd) Esys_Free(pd);
     Esys_FlushContext(esys, trial);
     return false;
 }
-
-
 
           </code></pre>
         </div>
@@ -237,15 +231,16 @@ static bool build_pcr_policy_digest(ESYS_CONTEXT* esys,
         </div>
         <div class="code-wrap">
           <pre><code contenteditable="true">
+            <!-- Your CODE goes here -->
 Indigo::bool_t TPMManager_User::seal_nvram(
     Indigo::uint32_t nv_index,
     const TPM::TPMManager::HashAlgorithmEnum& name_alg,
     const Indigo::Vector<Indigo::uint8_t>& auth_value,
     const Indigo::Vector<Indigo::uint8_t>& data,
-    const Indigo::Vector<Indigo::uint8_t>& pcrs,
-    const TPM::TPMManager::HashAlgorithmEnum& pcr_bank)
+    const Indigo::Vector<Indigo::uint8_t>& pcrs /* optional */,
+    const TPM::TPMManager::HashAlgorithmEnum& pcr_bank /* optional */)
 {
-    // 1) Initialize ESAPI
+    // 0) ESAPI init
     TSS2_ABI_VERSION abi = TSS2_ABI_VERSION_CURRENT;
     ESYS_CONTEXT* esys = nullptr;
     TSS2_RC rc = Esys_Initialize(&esys, p_tcti_context, &abi);
@@ -254,115 +249,108 @@ Indigo::bool_t TPMManager_User::seal_nvram(
         return false;
     }
 
-    // Common handles/auths
-    ESYS_TR owner = ESYS_TR_RH_OWNER;
-    TPM2B_AUTH ownerAuth{}; ownerAuth.size = 0;            // default empty
-    Esys_TR_SetAuth(esys, owner, &ownerAuth);
-
-    // 2) Prepare NV public template
-    TPM2B_NV_PUBLIC pub{};
-    pub.size = sizeof(pub.nvPublic);
-    pub.nvPublic.nvIndex  = nv_index;
-    pub.nvPublic.nameAlg  = parse_hash_algorithm(name_alg);
-    pub.nvPublic.dataSize = static_cast<UINT16>(data.size());
-    pub.nvPublic.attributes = TPMA_NV_NO_DA;   // good default
+    const TPMI_ALG_HASH nv_name_alg = parse_hash_algorithm(name_alg);
+    if (nv_name_alg == TPM2_ALG_NULL) { Esys_Finalize(&esys); return false; }
 
     const bool use_policy = !pcrs.empty();
+    const TPMI_ALG_HASH pcr_hash = use_policy ? parse_hash_algorithm(pcr_bank) : TPM2_ALG_NULL;
+    if (use_policy && pcr_hash == TPM2_ALG_NULL) { Esys_Finalize(&esys); return false; }
+
+    // 1) Owner auth (default empty unless your platform set one)
+    ESYS_TR owner = ESYS_TR_RH_OWNER;
+    TPM2B_AUTH ownerAuth{}; ownerAuth.size = 0;
+    Esys_TR_SetAuth(esys, owner, &ownerAuth);
+
+    // 2) Build NV public template
+    TPM2B_NV_PUBLIC pub{}; pub.size = sizeof(pub.nvPublic);
+    pub.nvPublic.nvIndex  = nv_index;
+    pub.nvPublic.nameAlg  = nv_name_alg;
+    pub.nvPublic.dataSize = static_cast<UINT16>(data.size());
+    pub.nvPublic.attributes = TPMA_NV_NO_DA; // good default, add others below
 
     if (use_policy) {
-        // Policy protects READ and WRITE
         pub.nvPublic.attributes |= TPMA_NV_POLICYREAD | TPMA_NV_POLICYWRITE;
-
-        // Build authPolicy bound to current PCRs
         TPM2B_DIGEST policy{};
-        const TPMI_ALG_HASH pcr_hash = parse_hash_algorithm(pcr_bank);
-        if (pcr_hash == TPM2_ALG_NULL ||
-            !build_pcr_policy_digest(esys, pub.nvPublic.nameAlg, pcr_hash,
+        if (!build_pcr_policy_digest(esys, nv_name_alg, pcr_hash,
                                      std::vector<uint8_t>(pcrs.begin(), pcrs.end()),
                                      policy)) {
-            LOG(ERROR) << "seal_nvram: failed to build PCR policy digest";
+            LOG(ERROR) << "seal_nvram: Policy digest build failed";
             Esys_Finalize(&esys);
             return false;
         }
         pub.nvPublic.authPolicy = policy;
     } else {
-        // Password (authValue) protects READ and WRITE
         pub.nvPublic.attributes |= TPMA_NV_AUTHREAD | TPMA_NV_AUTHWRITE;
     }
 
-    // 3) Define the NV space (set initial authValue even if policy is used)
-    TPM2B_AUTH indexAuth{};
-    indexAuth.size = std::min<size_t>(auth_value.size(), sizeof indexAuth.buffer);
-    if (indexAuth.size) {
-        memcpy(indexAuth.buffer, auth_value.data(), indexAuth.size);
-    }
+    // 3) Index auth value (PIN/password). Still set even if using policy.
+    TPM2B_AUTH indexAuth{}; indexAuth.size =
+        std::min<size_t>(auth_value.size(), sizeof indexAuth.buffer);
+    if (indexAuth.size) memcpy(indexAuth.buffer, auth_value.data(), indexAuth.size);
 
-    rc = Esys_NV_DefineSpace(esys, owner,
-                             ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-                             &indexAuth, &pub);
-    if (rc != TSS2_RC_SUCCESS) {
-        // If already defined, you could choose to continue instead of failing.
-        LOG(ERROR) << "seal_nvram: NV_DefineSpace rc=0x" << std::hex << rc;
-        Esys_Finalize(&esys);
-        return false;
-    }
-
-    // 4) Get a handle to the NV index
+    // 4) Define space (correct signature) → returns an ESYS_TR nvHandle
     ESYS_TR nvHandle = ESYS_TR_NONE;
-    rc = Esys_TR_FromTPMPublic(esys, nv_index,
-                               ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                               &nvHandle);
+    rc = Esys_NV_DefineSpace(esys, owner,
+                             /*sh1*/ESYS_TR_PASSWORD, /*sh2*/ESYS_TR_NONE, /*sh3*/ESYS_TR_NONE,
+                             &indexAuth, &pub, &nvHandle);
+
     if (rc != TSS2_RC_SUCCESS) {
-        LOG(ERROR) << "seal_nvram: TR_FromTPMPublic rc=0x" << std::hex << rc;
-        Esys_Finalize(&esys);
-        return false;
+        // If it's already defined, grab a handle and continue; otherwise fail.
+        // (Common TPM return for "already defined" is TPM2_RC_NV_DEFINED mapped into TSS2_RC layer.)
+        LOG(WARNING) << "seal_nvram: NV_DefineSpace rc=0x" << std::hex << rc
+                     << " — trying TR_FromTPMPublic";
+        rc = Esys_TR_FromTPMPublic(esys, nv_index, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                   &nvHandle);
+        if (rc != TSS2_RC_SUCCESS) {
+            LOG(ERROR) << "seal_nvram: TR_FromTPMPublic rc=0x" << std::hex << rc;
+            Esys_Finalize(&esys);
+            return false;
+        }
+        // If the existing index has different attributes/policy/size, NV_Write will fail.
+        // In that case you may need to NV_UndefineSpace + re-define (requires owner auth).
     }
 
-    // 5) Authorize and write
+    // 5) Prepare authorization for the write
     ESYS_TR sh1 = ESYS_TR_NONE, sh2 = ESYS_TR_NONE, sh3 = ESYS_TR_NONE;
-
-    ESYS_TR authHandle = nvHandle; // we authorize as the index itself
+    ESYS_TR authHandle = nvHandle;
 
     if (use_policy) {
-        // Start a POLICY session that satisfies PolicyPCR (must match the policy used above)
+        // Start a POLICY session that satisfies PolicyPCR (must match the policy above)
         ESYS_TR policy = ESYS_TR_NONE;
         TPMT_SYM_DEF symmetric; symmetric.algorithm = TPM2_ALG_NULL;
         TPM2B_NONCE nonce{}; nonce.size = 0;
 
-        rc = Esys_StartAuthSession(
-            esys, ESYS_TR_NONE, ESYS_TR_NONE,
-            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-            &nonce, TPM2_SE_POLICY, &symmetric, pub.nvPublic.nameAlg, &policy);
+        rc = Esys_StartAuthSession(esys, ESYS_TR_NONE, ESYS_TR_NONE,
+                                   ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                   &nonce, TPM2_SE_POLICY, &symmetric, nv_name_alg, &policy);
         if (rc != TSS2_RC_SUCCESS) {
             LOG(ERROR) << "seal_nvram: StartAuthSession(policy) rc=0x" << std::hex << rc;
+            if (nvHandle != ESYS_TR_NONE) Esys_TR_Close(esys, &nvHandle);
             Esys_Finalize(&esys);
             return false;
         }
 
-        // Recreate the same selection and call PolicyPCR
         TPMS_PCR_SELECTION one{};
-        set_pcr_selection(one, parse_hash_algorithm(pcr_bank),
-                          std::vector<uint8_t>(pcrs.begin(), pcrs.end()));
+        set_pcr_selection(one, pcr_hash, std::vector<uint8_t>(pcrs.begin(), pcrs.end()));
         TPML_PCR_SELECTION sels{}; sels.count = 1; sels.pcrSelections[0] = one;
 
-        rc = Esys_PolicyPCR(esys, policy,
-                            ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+        rc = Esys_PolicyPCR(esys, policy, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
                             /*pcrDigest*/nullptr, &sels);
         if (rc != TSS2_RC_SUCCESS) {
-            LOG(ERROR) << "seal_nvram: PolicyPCR (policy session) rc=0x" << std::hex << rc;
+            LOG(ERROR) << "seal_nvram: PolicyPCR rc=0x" << std::hex << rc;
             Esys_FlushContext(esys, policy);
+            Esys_TR_Close(esys, &nvHandle);
             Esys_Finalize(&esys);
             return false;
         }
-        // Use policy session as shandle1
-        sh1 = policy;
+        sh1 = policy; // use the policy session to authorize NV_Write
     } else {
-        // Password auth on the index
+        // Password auth on the index itself
         Esys_TR_SetAuth(esys, nvHandle, &indexAuth);
         sh1 = ESYS_TR_PASSWORD;
     }
 
-    // 6) Chunked write
+    // 6) Chunked NV_Write
     UINT16 offset = 0;
     while (offset < data.size()) {
         TPM2B_MAX_NV_BUFFER chunk{};
@@ -376,6 +364,7 @@ Indigo::bool_t TPMManager_User::seal_nvram(
             LOG(ERROR) << "seal_nvram: NV_Write rc=0x" << std::hex << rc
                        << " at offset " << std::dec << offset;
             if (use_policy && sh1 != ESYS_TR_PASSWORD) Esys_FlushContext(esys, sh1);
+            Esys_TR_Close(esys, &nvHandle);
             Esys_Finalize(&esys);
             return false;
         }
@@ -383,6 +372,7 @@ Indigo::bool_t TPMManager_User::seal_nvram(
     }
 
     if (use_policy && sh1 != ESYS_TR_PASSWORD) Esys_FlushContext(esys, sh1);
+    Esys_TR_Close(esys, &nvHandle);  // release ESYS handle
     Esys_Finalize(&esys);
     return true;
 }
