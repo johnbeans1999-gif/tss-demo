@@ -165,38 +165,119 @@
         <div class="code-wrap">
           <pre><code contenteditable="true">
 <!-- Your CODE goes here -->
-Indigo::bool_t TPMManager_User::check_index_defined(Indigo::uint32_t nv_index)
+Indigo::bool_t TPMManager_User::nv_undefine(
+    Indigo::uint32_t nv_index,
+    const Indigo::Vector<Indigo::uint8_t>& owner_auth,
+    const Indigo::Vector<Indigo::uint8_t>& platform_auth)
 {
-    // Init ESAPI
+    // 0) ESAPI init
     TSS2_ABI_VERSION abi = TSS2_ABI_VERSION_CURRENT;
     ESYS_CONTEXT* esys = nullptr;
     TSS2_RC rc = Esys_Initialize(&esys, p_tcti_context, &abi);
     if (rc != TSS2_RC_SUCCESS) {
-        LOG(ERROR) << "check_index_defined: Esys_Initialize rc=0x" << std::hex << rc;
+        LOG(ERROR) << "nv_undefine: Esys_Initialize rc=0x" << std::hex << rc;
         return false;
     }
 
-    // Try to get a handle to the public object at nv_index
+    // 1) If it doesn't exist, we're "done" (idempotent success)
     ESYS_TR nvHandle = ESYS_TR_NONE;
     rc = Esys_TR_FromTPMPublic(esys, nv_index, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &nvHandle);
     if (rc != TSS2_RC_SUCCESS) {
-        // No such handle / not defined
+        LOG(INFO) << "nv_undefine: index 0x" << std::hex << nv_index << " not defined";
+        Esys_Finalize(&esys);
+        return true;
+    }
+
+    // 2) Read public area to determine attributes / creator
+    TPM2B_NV_PUBLIC* pub = nullptr;
+    TPM2B_NAME* name = nullptr;
+    rc = Esys_NV_ReadPublic(esys, nvHandle, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &pub, &name);
+    if (rc != TSS2_RC_SUCCESS || !pub) {
+        LOG(ERROR) << "nv_undefine: NV_ReadPublic rc=0x" << std::hex << rc;
+        if (name) Esys_Free(name);
+        Esys_TR_Close(esys, &nvHandle);
         Esys_Finalize(&esys);
         return false;
     }
 
-    // Confirm it's an NV index by reading its public area (no auth required)
-    TPM2B_NV_PUBLIC* pub = nullptr;
-    TPM2B_NAME* name = nullptr;
-    rc = Esys_NV_ReadPublic(esys, nvHandle, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &pub, &name);
+    TPMA_NV attrs = pub->nvPublic.attributes;
+    const bool platform_created = (attrs & TPMA_NV_PLATFORMCREATE) != 0;
+    const bool policy_delete    = (attrs & TPMA_NV_POLICY_DELETE) != 0;
 
-    const bool defined = (rc == TSS2_RC_SUCCESS && pub != nullptr);
+    // NOTE: This helper does not implement POLICY_DELETE flows. Most standard indexes
+    // (including ones you defined with AUTHREAD/AUTHWRITE or POLICYREAD/POLICYWRITE)
+    // do NOT set POLICY_DELETE; for those, NV_UndefineSpace is sufficient.
+    if (policy_delete) {
+        LOG(ERROR) << "nv_undefine: index has TPMA_NV_POLICY_DELETE; "
+                   << "NV_UndefineSpaceSpecial + policy session required (not implemented here).";
+        Esys_Free(pub); if (name) Esys_Free(name);
+        Esys_TR_Close(esys, &nvHandle);
+        Esys_Finalize(&esys);
+        return false;
+    }
 
-    if (pub)  Esys_Free(pub);
-    if (name) Esys_Free(name);
+    // 3) Choose hierarchy (Owner for owner-created; Platform for platform-created)
+    ESYS_TR authHandle = platform_created ? ESYS_TR_RH_PLATFORM : ESYS_TR_RH_OWNER;
+
+    // Set hierarchy auth (empty by default unless you configured one)
+    TPM2B_AUTH authBuf{};
+    if (platform_created) {
+        authBuf.size = std::min<size_t>(platform_auth.size(), sizeof authBuf.buffer);
+        if (authBuf.size) memcpy(authBuf.buffer, platform_auth.data(), authBuf.size);
+        Esys_TR_SetAuth(esys, authHandle, &authBuf);
+    } else {
+        authBuf.size = std::min<size_t>(owner_auth.size(), sizeof authBuf.buffer);
+        if (authBuf.size) memcpy(authBuf.buffer, owner_auth.data(), authBuf.size);
+        Esys_TR_SetAuth(esys, authHandle, &authBuf);
+    }
+
+    // 4) Attempt undefine under the chosen hierarchy
+    rc = Esys_NV_UndefineSpace(esys,
+                               authHandle, nvHandle,
+                               /*sh1*/ESYS_TR_PASSWORD, /*sh2*/ESYS_TR_NONE, /*sh3*/ESYS_TR_NONE);
+
+    if (rc != TSS2_RC_SUCCESS) {
+        // Fallback: try the other hierarchy in case the PLATFORMCREATE bit is misleading
+        LOG(WARNING) << "nv_undefine: NV_UndefineSpace rc=0x" << std::hex << rc
+                     << " with " << (platform_created ? "PLATFORM" : "OWNER")
+                     << " — retrying with the other hierarchy";
+
+        ESYS_TR altAuth = platform_created ? ESYS_TR_RH_OWNER : ESYS_TR_RH_PLATFORM;
+        TPM2B_AUTH altBuf{};
+        if (altAuth == ESYS_TR_RH_OWNER) {
+            altBuf.size = std::min<size_t>(owner_auth.size(), sizeof altBuf.buffer);
+            if (altBuf.size) memcpy(altBuf.buffer, owner_auth.data(), altBuf.size);
+        } else {
+            altBuf.size = std::min<size_t>(platform_auth.size(), sizeof altBuf.buffer);
+            if (altBuf.size) memcpy(altBuf.buffer, platform_auth.data(), altBuf.size);
+        }
+        Esys_TR_SetAuth(esys, altAuth, &altBuf);
+
+        rc = Esys_NV_UndefineSpace(esys, altAuth, nvHandle,
+                                   ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE);
+        if (rc != TSS2_RC_SUCCESS) {
+            LOG(ERROR) << "nv_undefine: NV_UndefineSpace rc=0x" << std::hex << rc << " (final)";
+            Esys_Free(pub); if (name) Esys_Free(name);
+            Esys_TR_Close(esys, &nvHandle);
+            Esys_Finalize(&esys);
+            return false;
+        }
+    }
+
+    // 5) Clean up and confirm it’s gone
+    Esys_Free(pub); if (name) Esys_Free(name);
     Esys_TR_Close(esys, &nvHandle);
+
+    // Double-check: it should no longer be resolvable
+    ESYS_TR check = ESYS_TR_NONE;
+    rc = Esys_TR_FromTPMPublic(esys, nv_index, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &check);
     Esys_Finalize(&esys);
-    return defined;
+
+    const bool gone = (rc != TSS2_RC_SUCCESS);
+    if (!gone) {
+        LOG(WARNING) << "nv_undefine: index still resolvable after undefine";
+    }
+    return gone;
 }
 
           </code></pre>
@@ -214,150 +295,6 @@ Indigo::bool_t TPMManager_User::check_index_defined(Indigo::uint32_t nv_index)
         <div class="code-wrap">
           <pre><code contenteditable="true">
             <!-- Your CODE goes here -->
-Indigo::bool_t TPMManager_User::seal_nvram(
-    Indigo::uint32_t nv_index,
-    const TPM::TPMManager::HashAlgorithmEnum& name_alg,
-    const Indigo::Vector<Indigo::uint8_t>& auth_value,
-    const Indigo::Vector<Indigo::uint8_t>& data,
-    const Indigo::Vector<Indigo::uint8_t>& pcrs /* optional */,
-    const TPM::TPMManager::HashAlgorithmEnum& pcr_bank /* optional */)
-{
-    // 0) ESAPI init
-    TSS2_ABI_VERSION abi = TSS2_ABI_VERSION_CURRENT;
-    ESYS_CONTEXT* esys = nullptr;
-    TSS2_RC rc = Esys_Initialize(&esys, p_tcti_context, &abi);
-    if (rc != TSS2_RC_SUCCESS) {
-        LOG(ERROR) << "seal_nvram: Esys_Initialize rc=0x" << std::hex << rc;
-        return false;
-    }
-
-    const TPMI_ALG_HASH nv_name_alg = parse_hash_algorithm(name_alg);
-    if (nv_name_alg == TPM2_ALG_NULL) { Esys_Finalize(&esys); return false; }
-
-    const bool use_policy = !pcrs.empty();
-    const TPMI_ALG_HASH pcr_hash = use_policy ? parse_hash_algorithm(pcr_bank) : TPM2_ALG_NULL;
-    if (use_policy && pcr_hash == TPM2_ALG_NULL) { Esys_Finalize(&esys); return false; }
-
-    // 1) Owner auth (default empty unless your platform set one)
-    ESYS_TR owner = ESYS_TR_RH_OWNER;
-    TPM2B_AUTH ownerAuth{}; ownerAuth.size = 0;
-    Esys_TR_SetAuth(esys, owner, &ownerAuth);
-
-    // 2) Build NV public template
-    TPM2B_NV_PUBLIC pub{}; pub.size = sizeof(pub.nvPublic);
-    pub.nvPublic.nvIndex  = nv_index;
-    pub.nvPublic.nameAlg  = nv_name_alg;
-    pub.nvPublic.dataSize = static_cast<UINT16>(data.size());
-    pub.nvPublic.attributes = TPMA_NV_NO_DA; // good default, add others below
-
-    if (use_policy) {
-        pub.nvPublic.attributes |= TPMA_NV_POLICYREAD | TPMA_NV_POLICYWRITE;
-        TPM2B_DIGEST policy{};
-        if (!build_pcr_policy_digest(esys, nv_name_alg, pcr_hash,
-                                     std::vector<uint8_t>(pcrs.begin(), pcrs.end()),
-                                     policy)) {
-            LOG(ERROR) << "seal_nvram: Policy digest build failed";
-            Esys_Finalize(&esys);
-            return false;
-        }
-        pub.nvPublic.authPolicy = policy;
-    } else {
-        pub.nvPublic.attributes |= TPMA_NV_AUTHREAD | TPMA_NV_AUTHWRITE;
-    }
-
-    // 3) Index auth value (PIN/password). Still set even if using policy.
-    TPM2B_AUTH indexAuth{}; indexAuth.size =
-        std::min<size_t>(auth_value.size(), sizeof indexAuth.buffer);
-    if (indexAuth.size) memcpy(indexAuth.buffer, auth_value.data(), indexAuth.size);
-
-    // 4) Define space (correct signature) → returns an ESYS_TR nvHandle
-    ESYS_TR nvHandle = ESYS_TR_NONE;
-    rc = Esys_NV_DefineSpace(esys, owner,
-                             /*sh1*/ESYS_TR_PASSWORD, /*sh2*/ESYS_TR_NONE, /*sh3*/ESYS_TR_NONE,
-                             &indexAuth, &pub, &nvHandle);
-
-    if (rc != TSS2_RC_SUCCESS) {
-        // If it's already defined, grab a handle and continue; otherwise fail.
-        // (Common TPM return for "already defined" is TPM2_RC_NV_DEFINED mapped into TSS2_RC layer.)
-        LOG(WARNING) << "seal_nvram: NV_DefineSpace rc=0x" << std::hex << rc
-                     << " — trying TR_FromTPMPublic";
-        rc = Esys_TR_FromTPMPublic(esys, nv_index, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                                   &nvHandle);
-        if (rc != TSS2_RC_SUCCESS) {
-            LOG(ERROR) << "seal_nvram: TR_FromTPMPublic rc=0x" << std::hex << rc;
-            Esys_Finalize(&esys);
-            return false;
-        }
-        // If the existing index has different attributes/policy/size, NV_Write will fail.
-        // In that case you may need to NV_UndefineSpace + re-define (requires owner auth).
-    }
-
-    // 5) Prepare authorization for the write
-    ESYS_TR sh1 = ESYS_TR_NONE, sh2 = ESYS_TR_NONE, sh3 = ESYS_TR_NONE;
-    ESYS_TR authHandle = nvHandle;
-
-    if (use_policy) {
-        // Start a POLICY session that satisfies PolicyPCR (must match the policy above)
-        ESYS_TR policy = ESYS_TR_NONE;
-        TPMT_SYM_DEF symmetric; symmetric.algorithm = TPM2_ALG_NULL;
-        TPM2B_NONCE nonce{}; nonce.size = 0;
-
-        rc = Esys_StartAuthSession(esys, ESYS_TR_NONE, ESYS_TR_NONE,
-                                   ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                                   &nonce, TPM2_SE_POLICY, &symmetric, nv_name_alg, &policy);
-        if (rc != TSS2_RC_SUCCESS) {
-            LOG(ERROR) << "seal_nvram: StartAuthSession(policy) rc=0x" << std::hex << rc;
-            if (nvHandle != ESYS_TR_NONE) Esys_TR_Close(esys, &nvHandle);
-            Esys_Finalize(&esys);
-            return false;
-        }
-
-        TPMS_PCR_SELECTION one{};
-        set_pcr_selection(one, pcr_hash, std::vector<uint8_t>(pcrs.begin(), pcrs.end()));
-        TPML_PCR_SELECTION sels{}; sels.count = 1; sels.pcrSelections[0] = one;
-
-        rc = Esys_PolicyPCR(esys, policy, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
-                            /*pcrDigest*/nullptr, &sels);
-        if (rc != TSS2_RC_SUCCESS) {
-            LOG(ERROR) << "seal_nvram: PolicyPCR rc=0x" << std::hex << rc;
-            Esys_FlushContext(esys, policy);
-            Esys_TR_Close(esys, &nvHandle);
-            Esys_Finalize(&esys);
-            return false;
-        }
-        sh1 = policy; // use the policy session to authorize NV_Write
-    } else {
-        // Password auth on the index itself
-        Esys_TR_SetAuth(esys, nvHandle, &indexAuth);
-        sh1 = ESYS_TR_PASSWORD;
-    }
-
-    // 6) Chunked NV_Write
-    UINT16 offset = 0;
-    while (offset < data.size()) {
-        TPM2B_MAX_NV_BUFFER chunk{};
-        const UINT16 n = static_cast<UINT16>(
-            std::min<size_t>(TPM2_MAX_NV_BUFFER_SIZE, data.size() - offset));
-        chunk.size = n;
-        memcpy(chunk.buffer, &data[offset], n);
-
-        rc = Esys_NV_Write(esys, authHandle, nvHandle, sh1, sh2, sh3, &chunk, offset);
-        if (rc != TSS2_RC_SUCCESS) {
-            LOG(ERROR) << "seal_nvram: NV_Write rc=0x" << std::hex << rc
-                       << " at offset " << std::dec << offset;
-            if (use_policy && sh1 != ESYS_TR_PASSWORD) Esys_FlushContext(esys, sh1);
-            Esys_TR_Close(esys, &nvHandle);
-            Esys_Finalize(&esys);
-            return false;
-        }
-        offset += n;
-    }
-
-    if (use_policy && sh1 != ESYS_TR_PASSWORD) Esys_FlushContext(esys, sh1);
-    Esys_TR_Close(esys, &nvHandle);  // release ESYS handle
-    Esys_Finalize(&esys);
-    return true;
-}
 
           </code></pre>
         </div>
