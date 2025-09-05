@@ -165,6 +165,75 @@
         <div class="code-wrap">
           <pre><code contenteditable="true">
 <!-- Your CODE goes here -->
+Indigo::Vector<Indigo::uint32_t> TPMManager_User::list_nv_indexes()
+{
+    Indigo::Vector<Indigo::uint32_t> out;
+
+    // ESAPI init
+    TSS2_ABI_VERSION abi = TSS2_ABI_VERSION_CURRENT;
+    ESYS_CONTEXT* esys = nullptr;
+    TSS2_RC rc = Esys_Initialize(&esys, p_tcti_context, &abi);
+    if (rc != TSS2_RC_SUCCESS) {
+        LOG(ERROR) << "list_nv_indexes: Esys_Initialize rc=0x" << std::hex << rc;
+        return out;
+    }
+
+    TPMI_YES_NO more = TPM2_NO;
+    TPMS_CAPABILITY_DATA* cap = nullptr;
+    UINT32 selector = TPM2_HR_NV_INDEX;  // start of NV handle range (0x01000000)
+
+    do {
+        // Fetch up to N handles in the NV range
+        rc = Esys_GetCapability(esys, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                TPM2_CAP_HANDLES, selector, /*count*/64, &more, &cap);
+        if (rc != TSS2_RC_SUCCESS || !cap) {
+            LOG(ERROR) << "list_nv_indexes: GetCapability(handles-nv) rc=0x" << std::hex << rc;
+            Esys_Finalize(&esys);
+            return Indigo::Vector<Indigo::uint32_t>(); // empty on error
+        }
+
+        const TPML_HANDLE& hs = cap->data.handles;
+
+        // Confirm each handle still exists by reading its public area
+        for (UINT32 i = 0; i < hs.count; ++i) {
+            ESYS_TR nvHandle = ESYS_TR_NONE;
+            if (Esys_TR_FromTPMPublic(esys, hs.handle[i],
+                                      ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &nvHandle)
+                != TSS2_RC_SUCCESS) {
+                continue; // skip if it disappeared between calls
+            }
+
+            TPM2B_NV_PUBLIC* pub = nullptr;
+            TPM2B_NAME* name = nullptr;
+            rc = Esys_NV_ReadPublic(esys, nvHandle,
+                                    ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                    &pub, &name);
+            if (rc == TSS2_RC_SUCCESS && pub) {
+                out.push_back(static_cast<Indigo::uint32_t>(hs.handle[i]));
+            }
+
+            if (pub)  Esys_Free(pub);
+            if (name) Esys_Free(name);
+            Esys_TR_Close(esys, &nvHandle);
+        }
+
+        // Prepare next page (continue after the last handle we saw)
+        if (hs.count > 0) {
+            const UINT32 last = hs.handle[hs.count - 1];
+            if (last == 0xFFFFFFFF) {
+                more = TPM2_NO; // avoid wrap
+            } else {
+                selector = last + 1;
+            }
+        }
+
+        Esys_Free(cap);
+        cap = nullptr;
+    } while (more == TPM2_YES);
+
+    Esys_Finalize(&esys);
+    return out;
+}
 
           </code></pre>
         </div>
