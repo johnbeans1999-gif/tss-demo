@@ -165,6 +165,60 @@
         <div class="code-wrap">
           <pre><code contenteditable="true">
 <!-- Your CODE goes here -->
+#include <chrono>   // only for the tiny fallback
+
+static inline UINT16 hash_size(TPMI_ALG_HASH a) {
+    switch (a) {
+        case TPM2_ALG_SHA1:   return 20;
+        case TPM2_ALG_SHA256: return 32;
+        case TPM2_ALG_SHA384: return 48;
+        case TPM2_ALG_SHA512: return 64;
+        default:              return 32; // safe default
+    }
+}
+
+// Get a non-zero-length nonce directly from the TPM RNG.
+// - esys: a live ESYS_CONTEXT*
+// - auth_hash: use the SAME hash as your session (typically the NV nameAlg)
+static TPM2B_NONCE make_nonce(ESYS_CONTEXT* esys, TPMI_ALG_HASH auth_hash) {
+    TPM2B_NONCE n{};
+    UINT16 want = hash_size(auth_hash);
+    UINT16 len  = (want < 16) ? 16 : want;              // spec-friendly minimum
+    if (len > sizeof n.buffer) len = sizeof n.buffer;   // TPM2B_NONCE max is 64
+    n.size = 0;
+
+    // Some TPMs return fewer bytes than requested; loop until we have 'len'
+    const int max_tries = 4;
+    int tries = 0;
+    while (n.size < len && tries++ < max_tries) {
+        TPM2B_DIGEST* rnd = nullptr;
+        UINT16 need = len - n.size;
+        TSS2_RC rc = Esys_GetRandom(esys,
+                                    ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                    need, &rnd);
+        if (rc == TSS2_RC_SUCCESS && rnd && rnd->size > 0) {
+            UINT16 copy = (rnd->size > need) ? need : rnd->size;
+            memcpy(n.buffer + n.size, rnd->buffer, copy);
+            n.size = static_cast<UINT16>(n.size + copy);
+        }
+        if (rnd) Esys_Free(rnd);
+    }
+
+    // Last-resort fallback: ensure we never return size 0 (avoids TPM_RC_SIZE 0x1D5)
+    if (n.size == 0) {
+        n.size = (len < 16) ? 16 : len;
+        uint64_t seed = static_cast<uint64_t>(
+            std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        for (UINT16 i = 0; i < n.size; ++i) {
+            // xorshift64*
+            seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27;
+            uint64_t z = seed * 2685821657736338717ULL;
+            n.buffer[i] = static_cast<BYTE>(z & 0xFF);
+        }
+    }
+
+    return n;
+}
 
           </code></pre>
         </div>
